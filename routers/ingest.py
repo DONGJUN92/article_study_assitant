@@ -159,7 +159,7 @@ async def list_documents():
     ]
 
 
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 @router.get("/documents/{doc_id}/pdf")
 async def get_document_pdf(doc_id: str):
@@ -167,6 +167,15 @@ async def get_document_pdf(doc_id: str):
     if pdf_path and pdf_path.exists():
         return FileResponse(pdf_path, media_type="application/pdf")
     raise HTTPException(404, "PDF file not found")
+
+
+@router.get("/documents/{doc_id}/layout/{page_num}")
+async def get_document_layout(doc_id: str, page_num: int):
+    """Returns an image of the specified page with parsed layout boundaries drawn."""
+    img_bytes = pdf_service.render_page_layout(doc_id, page_num)
+    if img_bytes:
+        return Response(content=img_bytes, media_type="image/png")
+    raise HTTPException(404, "Page layout could not be rendered or document not found.")
 
 
 @router.delete("/documents/{doc_id}")

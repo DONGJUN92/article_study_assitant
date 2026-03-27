@@ -10,7 +10,21 @@ from pathlib import Path
 from typing import List, Optional
 
 import pdfplumber
+import fitz
 from langdetect import detect
+from services.ocr_service import ocr_service
+
+import nltk
+from nltk.tokenize import sent_tokenize
+
+try:
+    nltk.data.find('tokenizers/punkt_tab')
+except LookupError:
+    nltk.download('punkt_tab', quiet=True)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
 
 from config import DOCUMENTS_DIR, CHUNK_SIZE, CHUNK_OVERLAP
 
@@ -37,6 +51,130 @@ class PDFService:
             cleaned_blocks.append(b.strip())
         return "\n\n".join(b for b in cleaned_blocks if b)
 
+    def _extract_words_smart_layout(self, page_width: float, words: List[dict]) -> List[dict]:
+        """
+        Extract words applying a smart gutter layout heuristic and PyMuPDF block/line numbers.
+        This entirely eliminates geometric clustering (top // 8), preventing vertical line overlap.
+        """
+        if not words:
+            return []
+            
+        center_start = page_width * 0.35
+        center_mid = page_width * 0.50
+        center_end = page_width * 0.65
+        
+        left_x1s = [round(w['x1']) for w in words if center_start < w['x1'] < (center_mid + page_width * 0.05)]
+        right_x0s = [round(w['x0']) for w in words if (center_mid - page_width * 0.05) < w['x0'] < center_end]
+        
+        if left_x1s and right_x0s:
+            from collections import Counter
+            best_left_x1 = Counter(left_x1s).most_common(1)[0][0]
+            best_right_x0 = Counter(right_x0s).most_common(1)[0][0]
+            if best_left_x1 < best_right_x0:
+                center_x = (best_left_x1 + best_right_x0) / 2.0
+            else:
+                center_x = page_width / 2.0
+        else:
+            center_x = page_width / 2.0
+            
+        gutter_margin = page_width * 0.015  # 1.5% margin
+
+        # Group words by PyMuPDF block numbers to prevent hidden layers/watermarks from interleaving
+        blocks_dict = {}
+        for w in words:
+            blocks_dict.setdefault(w.get('block_n', 0), []).append(w)
+            
+        final_words = []
+        
+        for b_num in sorted(blocks_dict.keys()):
+            b_words = blocks_dict[b_num]
+            
+            # Group into lines purely by fitz native line_n
+            line_dict = {}
+            for w in b_words:
+                line_dict.setdefault(w.get('line_n', 0), []).append(w)
+                
+            lines = []
+            for l_num in sorted(line_dict.keys()):
+                # Sort words within the visual line natively by PyMuPDF's word sequence number
+                line_words = line_dict[l_num]
+                line_words.sort(key=lambda w: w.get('word_n', 0))
+                lines.append(line_words)
+
+            typed_lines = []
+            for line in lines:
+                min_x = min(w['x0'] for w in line)
+                max_x = max(w['x1'] for w in line)
+
+                w_type = 'split'
+                if min_x < (center_x - gutter_margin) and max_x > (center_x + gutter_margin):
+                    has_spanning = False
+                    for w in line:
+                        if w['x0'] < (center_x - gutter_margin) and w['x1'] > (center_x + gutter_margin):
+                            has_spanning = True
+                            break
+                    w_type = 'spanning' if has_spanning else 'split'
+
+                typed_lines.append({'type': w_type, 'words': line})
+
+            sub_blocks = []
+            if not typed_lines:
+                continue
+            current_sub = {'type': typed_lines[0]['type'], 'lines': [typed_lines[0]['words']]}
+            for t_line in typed_lines[1:]:
+                if t_line['type'] == current_sub['type']:
+                    current_sub['lines'].append(t_line['words'])
+                else:
+                    sub_blocks.append(current_sub)
+                    current_sub = {'type': t_line['type'], 'lines': [t_line['words']]}
+            sub_blocks.append(current_sub)
+
+            for sb in sub_blocks:
+                if sb['type'] == 'spanning':
+                    sb_words = [w for line in sb['lines'] for w in line]
+                    # Sort primarily by sequential line number, then by word sequence
+                    sb_words.sort(key=lambda w: (w.get('line_n', 0), w.get('word_n', 0)))
+                    final_words.extend(sb_words)
+                else:
+                    left_words = []
+                    right_words = []
+                    for line in sb['lines']:
+                        for w in line:
+                            mid_x = (w['x0'] + w['x1']) / 2.0
+                            if mid_x < center_x:
+                                left_words.append(w)
+                            else:
+                                right_words.append(w)
+                    left_words.sort(key=lambda w: (w.get('line_n', 0), w.get('word_n', 0)))
+                    right_words.sort(key=lambda w: (w.get('line_n', 0), w.get('word_n', 0)))
+                    final_words.extend(left_words)
+                    final_words.extend(right_words)
+                    
+        return final_words
+
+    def _needs_ocr(self, page_text: str, fitz_words: list) -> bool:
+        """Heuristic to determine if a page is scanned or heavily corrupted and needs OCR."""
+        if len(fitz_words) < 20: 
+            return True # Likely a scanned image-only PDF
+            
+        import re
+        page_text_clean = page_text.replace(" ", "").replace("\n", "")
+        if not page_text_clean:
+            return True
+            
+        alpha_chars = len(re.sub(r'[^a-zA-Z]', '', page_text_clean))
+        total_chars = len(page_text_clean)
+        
+        # If less than 40% of the text is alphabetical, it's highly likely corrupted font mappings or heavy math.
+        # But to be safe against math-heavy papers, we specifically check for known corruption tokens like "CQ d fa"
+        if total_chars > 50 and (alpha_chars / total_chars) < 0.4:
+            return True
+            
+        if "CQ d fa" in page_text or "} {" in page_text:
+            return True
+            
+        return False
+
     def extract_from_url(self, url: str) -> dict:
         """Download & extract text from a PDF URL (file:// or http(s)://)."""
         import httpx
@@ -59,41 +197,92 @@ class PDFService:
         pages: List[dict] = []
         full_text_parts: List[str] = []
         sentence_map = []
-        sent_regex = re.compile(r'[^.!?]+[.!?]+(?:\s|$)')
         
         title = filename.replace(".pdf", "")
 
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            page_count = len(pdf.pages)
-            pdf_metadata = pdf.metadata or {}
+        try:
+            doc = fitz.open(stream=raw, filetype="pdf")
+            page_count = len(doc)
+            pdf_metadata = doc.metadata or {}
             
-            if pdf_metadata.get("Title"):
-                # Clean up PDF literal strings if present
-                raw_title = str(pdf_metadata.get("Title", "")).strip(" ()'")
+            if pdf_metadata.get("title"):
+                raw_title = str(pdf_metadata.get("title", "")).strip(" ()'")
                 if len(raw_title) > 5:
                     title = raw_title
                     
-            for i, page in enumerate(pdf.pages):
+            for i in range(page_count):
                 page_num = i + 1
-                words = page.extract_words(keep_blank_chars=False)
+                page = doc[i]
+                
+                # fitz word: (x0, top, x1, bottom, text, block_n, line_n, word_n)
+                fitz_words = page.get_text("words")
+                
+                # Check for OCR necessity based on preliminary extraction
+                prelim_text = " ".join([w[4] for w in fitz_words]) if fitz_words else ""
+                
+                words = []
+                if self._needs_ocr(prelim_text, fitz_words):
+                    # Trigger OCR fallback for this page
+                    # Render page to image at 150 DPI for fast OCR
+                    pix = page.get_pixmap(dpi=150)
+                    img_bytes = pix.tobytes("png")
+                    
+                    # ocr_service returns dicts: {x0, top, x1, bottom, text, block_n, line_n, word_n}
+                    try:
+                        words = ocr_service.extract_words(img_bytes)
+                    except Exception as e:
+                        print(f"OCR failed for page {page_num}: {e}")
+                        words = []
+                else:
+                    for w in fitz_words:
+                        words.append({
+                            'x0': w[0],
+                            'top': w[1],
+                            'x1': w[2],
+                            'bottom': w[3],
+                            'text': w[4],
+                            'block_n': w[5],
+                            'line_n': w[6],
+                            'word_n': w[7]
+                        })
+                
                 if not words:
                     continue
                 
-                # Reconstruct full text for this page
-                page_text = " ".join([w["text"] for w in words])
+                page_width = float(page.rect.width)
+                sorted_words = self._extract_words_smart_layout(page_width, words)
+                
+                page_text = " ".join([w["text"] for w in sorted_words])
                 pages.append({
                     "page": page_num,
                     "text": page_text
                 })
                 full_text_parts.append(page_text)
                 
-                # Break into sentences
-                sentences = [m.group().strip() for m in sent_regex.finditer(page_text) if m.group().strip()]
-                if not sentences and page_text:
-                    sentences = [page_text.strip()]
+                page_text_clean = re.sub(r'\s+', ' ', page_text).strip()
+                
+                try:
+                    tokenizer = nltk.data.load('tokenizers/punkt/english.pickle')
+                except LookupError:
+                    tokenizer = nltk.data.load('tokenizers/punkt_tab/english.pickle')
+                
+                tokenizer._params.abbrev_types.update(['al', 'e.g', 'i.e', 'fig', 'eq', 'vol', 'no', 'vs', 'cf'])
+                
+                sentences = tokenizer.tokenize(page_text_clean)
+                
+                merged_sents = []
+                for s in sentences:
+                    if merged_sents and re.match(r'^[a-z\(\[\,\;\:]', s.strip()):
+                        merged_sents[-1] = merged_sents[-1] + " " + s
+                    else:
+                        merged_sents.append(s)
+                sentences = merged_sents
+                
+                if not sentences and page_text_clean:
+                    sentences = [page_text_clean]
                     
                 word_idx = 0
-                num_words = len(words)
+                num_words = len(sorted_words)
                 
                 for sent in sentences:
                     sent_stripped = re.sub(r'\W', '', sent)
@@ -102,8 +291,7 @@ class PDFService:
                     rects = []
                     
                     while word_idx < num_words and consumed_len < target_len:
-                        w = words[word_idx]
-                        # pdfplumber rect is [x0, top, x1, bottom] (points)
+                        w = sorted_words[word_idx]
                         rects.append([w["x0"], w["top"], w["x1"], w["bottom"]])
                         w_text = str(w.get("text", ""))
                         consumed_len += len(re.sub(r'\W', '', w_text))
@@ -114,6 +302,12 @@ class PDFService:
                         "text": sent,
                         "rects": rects
                     })
+                    
+            doc.close()
+
+        except Exception as e:
+            print(f"Extraction error: {e}")
+            pass
 
         full_text = "\n\n".join(full_text_parts)
 
@@ -253,6 +447,40 @@ class PDFService:
             shutil.rmtree(doc_dir)
             return True
         return False
+
+    def render_page_layout(self, doc_id: str, page_num: int) -> Optional[bytes]:
+        """Render a specific PDF page as an image with bounding boxes drawn over sentences/words."""
+        pdf_path = self.get_document_pdf_path(doc_id)
+        if not pdf_path or not pdf_path.exists():
+            return None
+
+        # Load sentence rects
+        sentences = self.get_document_sentences(doc_id) or []
+        page_rects = []
+        for s in sentences:
+            if s.get("page") == page_num:
+                page_rects.extend(s.get("rects", []))
+
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(str(pdf_path))
+            if page_num < 1 or page_num > len(doc):
+                return None
+            
+            page = doc[page_num - 1]
+            
+            # Draw rects using fitz
+            for r in page_rects:
+                # r is [x0, top, x1, bottom]
+                rect = fitz.Rect(r[0], r[1], r[2], r[3])
+                page.draw_rect(rect, color=(1, 0, 0), width=1.5)
+            
+            # Render page to pixmap
+            pix = page.get_pixmap(dpi=150)
+            return pix.tobytes("png")
+        except Exception as e:
+            print(f"[PDFService] Render layout error: {e}")
+            return None
 
 
 pdf_service = PDFService()
